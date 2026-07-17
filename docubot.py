@@ -9,6 +9,20 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+
+VAGUE_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "it", "its",
+    "what", "whats", "how", "why", "who", "when", "where", "which",
+    "do", "does", "did", "can", "could", "would", "should", "will",
+    "i", "you", "he", "she", "we", "they", "me", "him", "her", "us", "them",
+    "help", "please", "hi", "hello", "hey", "up", "about", "info",
+    "tell", "explain", "know", "want", "need", "thing", "stuff", "things",
+    "and", "or", "but", "of", "to", "for", "on", "in", "with", "some",
+}
+
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -50,21 +64,16 @@ class DocuBot:
 
     def build_index(self, documents):
         """
-        TODO (Phase 1):
         Build a tiny inverted index mapping lowercase words to the documents
         they appear in.
-
-        Example structure:
-        {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
-        }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            words = re.findall(r"[a-z0-9]+", text.lower())
+            for word in set(words):
+                if word not in index:
+                    index[word] = set()
+                index[word].add(filename)
         return index
 
     # -----------------------------------------------------------
@@ -73,27 +82,71 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
         Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        The score rewards exact matches and also handles common synonym-style
+        overlaps such as 'generated' matching 'generation' or 'token' matching
+        'tokens'.
         """
-        # TODO: implement scoring
-        return 0
+        query_words = re.findall(r"[a-z0-9]+", query.lower())
+        text_words = re.findall(r"[a-z0-9]+", text.lower())
+
+        if not query_words:
+            return 0
+
+        score = 0
+        for word in query_words:
+            if word in text_words:
+                score += 2
+            elif word.endswith("s") and word[:-1] in text_words:
+                score += 1
+            elif word.endswith("ed") and word[:-2] in text_words:
+                score += 1
+            elif word.endswith("ing") and word[:-3] in text_words:
+                score += 1
+
+        return score
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
         Use the index and scoring function to select top_k relevant document snippets.
 
-        Return a list of (filename, text) sorted by score descending.
+        Return a list of (filename, text, score) sorted by score descending.
         """
         results = []
-        # TODO: implement retrieval logic
+        for filename, text in self.documents:
+            score = self.score_document(query, text)
+            if score > 0:
+                results.append((filename, text, score))
+
+        results.sort(key=lambda x: x[2], reverse=True)
         return results[:top_k]
+
+    # -----------------------------------------------------------
+    # Guardrails
+    # -----------------------------------------------------------
+
+    def is_too_vague(self, query):
+        """
+        Heuristic check for whether a query is too vague to answer from
+        these docs: either it has too few meaningful words, or none of
+        its words appear anywhere in the inverted index.
+        """
+        words = re.findall(r"[a-z0-9]+", query.lower())
+        meaningful = [w for w in words if w not in VAGUE_STOPWORDS]
+
+        if len(meaningful) < 2:
+            return True
+
+        if not any(w in self.index for w in meaningful):
+            return True
+
+        return False
+
+    VAGUE_MESSAGE = (
+        "Your question seems too vague for me to answer from these docs. "
+        "Could you mention a specific feature, file, or topic "
+        "(e.g. 'How is the auth token generated?')?"
+    )
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -102,16 +155,23 @@ class DocuBot:
     def answer_retrieval_only(self, query, top_k=3):
         """
         Phase 1 retrieval only mode.
-        Returns raw snippets and filenames with no LLM involved.
+        Returns compact snippets and filenames with no LLM involved.
         """
+        if self.is_too_vague(query):
+            return self.VAGUE_MESSAGE
+
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
             return "I do not know based on these docs."
 
         formatted = []
-        for filename, text in snippets:
-            formatted.append(f"[{filename}]\n{text}\n")
+        for filename, text, _score in snippets:
+            cleaned_text = re.sub(r"\s+", " ", text).strip()
+            paragraph = cleaned_text.split("\n\n", 1)[0]
+            if len(paragraph) > 220:
+                paragraph = paragraph[:217].rstrip() + "..."
+            formatted.append(f"[{filename}]\n{paragraph}\n")
 
         return "\n---\n".join(formatted)
 
@@ -125,6 +185,9 @@ class DocuBot:
             raise RuntimeError(
                 "RAG mode requires an LLM client. Provide a GeminiClient instance."
             )
+
+        if self.is_too_vague(query):
+            return self.VAGUE_MESSAGE
 
         snippets = self.retrieve(query, top_k=top_k)
 
